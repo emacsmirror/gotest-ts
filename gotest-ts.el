@@ -33,10 +33,15 @@
 ;; - Tree-sitter powered parsing for reliable syntax understanding
 ;; - DWIM (Do What I Mean) test execution
 ;; - Support for customizable subtest field names
+;; - Navigation between subtests with next/previous commands
 ;;
 ;; Usage:
 ;; Place your cursor on a test function or within a subtest case and run:
 ;; M-x gotest-ts-run-dwim
+;;
+;; Navigate between subtests:
+;; M-x gotest-ts-next-subtest  ; Go to next subtest
+;; M-x gotest-ts-prev-subtest  ; Go to previous subtest
 ;;
 ;; For table-driven tests like:
 ;;   func TestExample(t *testing.T) {
@@ -56,6 +61,8 @@
 ;;
 ;; Suggested keybinding:
 ;; (define-key go-ts-mode-map (kbd "C-c t r") #'gotest-ts-run-dwim)
+;; (define-key go-ts-mode-map (kbd "C-c t n") #'gotest-ts-next-subtest)
+;; (define-key go-ts-mode-map (kbd "C-c t p") #'gotest-ts-prev-subtest)
 
 ;;; Code:
 
@@ -220,18 +227,147 @@ Displays the test function name and subtest name (if any) in the minibuffer."
      (t
       (message "Not inside a test function")))))
 
+(defun gotest-ts--find-all-subtests ()
+  "Find all subtests in the current test function.
+Returns a list of (position . subtest-name) pairs, sorted by position."
+  (let ((defun-node (treesit-defun-at-point))
+        (subtests '()))
+
+    (when defun-node
+      ;; Search for all literal_value nodes within the function
+      (treesit-search-subtree
+       defun-node
+       (lambda (node)
+         (when (string-equal (treesit-node-type node) "literal_value")
+           (let ((children (treesit-node-children node))
+                 (subtest-name nil)
+                 (name-node nil))
+
+             ;; Look for the subtest field in this literal_value
+             (dolist (child children)
+               (when (string-equal (treesit-node-type child) "keyed_element")
+                 (let ((child-text (treesit-node-text child)))
+                   (when (string-match
+                          (format "^%s\\s-*:\\s-*[`\"]\\([^`\"]*\\)[`\"]"
+                                  (regexp-quote gotest-ts-subtest-field-name))
+                          child-text)
+                     (setq subtest-name
+                           (replace-regexp-in-string
+                            "\\s-+" "_"
+                            (match-string 1 child-text)))
+                     (setq name-node child)))))
+
+             ;; If we found a subtest, add it to our list
+             (when (and subtest-name name-node)
+               (push (cons (treesit-node-start name-node) subtest-name) subtests))))
+         nil)  ; Continue searching
+       t))  ; Include current node
+
+    ;; Sort by position in file
+    (sort subtests (lambda (a b) (< (car a) (car b))))))
+
+(defun gotest-ts--current-subtest-index ()
+  "Get the index of the current subtest, or nil if not in a subtest."
+  (let ((current-pos (point))
+        (subtests (gotest-ts--find-all-subtests))
+        (index 0)
+        (found-index nil))
+
+    (dolist (subtest subtests)
+      (when (>= current-pos (car subtest))
+        (setq found-index index))
+      (setq index (1+ index)))
+
+    found-index))
+
+;;;###autoload
+(defun gotest-ts-next-subtest ()
+  "Navigate to the next subtest in the current test function."
+  (interactive)
+
+  (gotest-ts--validate-environment)
+
+  (unless (gotest-ts--get-test-function-name)
+    (user-error "Not inside a test function"))
+
+  (let ((subtests (gotest-ts--find-all-subtests)))
+    (unless subtests
+      (user-error "No subtests found in current test function"))
+
+    (let ((current-index (gotest-ts--current-subtest-index))
+          (next-index nil))
+
+      (cond
+       ;; If we're not in any subtest, go to the first one
+       ((null current-index)
+        (setq next-index 0))
+       ;; If we're at the last subtest, wrap to first
+       ((>= current-index (1- (length subtests)))
+        (setq next-index 0)
+        (message "Wrapped to first subtest"))
+       ;; Otherwise, go to next subtest
+       (t
+        (setq next-index (1+ current-index))))
+
+      (let ((next-subtest (nth next-index subtests)))
+        (goto-char (car next-subtest))
+        (message "Subtest: %s (%d/%d)"
+                 (cdr next-subtest)
+                 (1+ next-index)
+                 (length subtests))))))
+
+;;;###autoload
+(defun gotest-ts-prev-subtest ()
+  "Navigate to the previous subtest in the current test function."
+  (interactive)
+
+  (gotest-ts--validate-environment)
+
+  (unless (gotest-ts--get-test-function-name)
+    (user-error "Not inside a test function"))
+
+  (let ((subtests (gotest-ts--find-all-subtests)))
+    (unless subtests
+      (user-error "No subtests found in current test function"))
+
+    (let ((current-index (gotest-ts--current-subtest-index))
+          (prev-index nil))
+
+      (cond
+       ;; If we're not in any subtest, go to the last one
+       ((null current-index)
+        (setq prev-index (1- (length subtests))))
+       ;; If we're at the first subtest, wrap to last
+       ((<= current-index 0)
+        (setq prev-index (1- (length subtests)))
+        (message "Wrapped to last subtest"))
+       ;; Otherwise, go to previous subtest
+       (t
+        (setq prev-index (1- current-index))))
+
+      (let ((prev-subtest (nth prev-index subtests)))
+        (goto-char (car prev-subtest))
+        (message "Subtest: %s (%d/%d)"
+                 (cdr prev-subtest)
+                 (1+ prev-index)
+                 (length subtests))))))
+
 ;;;###autoload
 (defun gotest-ts-setup-keybindings ()
   "Set up suggested keybindings for gotest-ts in Go modes.
 Binds the following keys in `go-mode-map' and `go-ts-mode-map':
 - C-c t r: `gotest-ts-run-dwim'
 - C-c t f: `gotest-ts-run-function'
-- C-c t i: `gotest-ts-show-test-info'"
+- C-c t i: `gotest-ts-show-test-info'
+- C-c t n: `gotest-ts-next-subtest'
+- C-c t p: `gotest-ts-prev-subtest'"
   (interactive)
 
   (let ((bindings '(("C-c t r" . gotest-ts-run-dwim)
                     ("C-c t f" . gotest-ts-run-function)
-                    ("C-c t i" . gotest-ts-show-test-info))))
+                    ("C-c t i" . gotest-ts-show-test-info)
+                    ("C-c t n" . gotest-ts-next-subtest)
+                    ("C-c t p" . gotest-ts-prev-subtest))))
 
     (dolist (binding bindings)
       (when (boundp 'go-mode-map)
