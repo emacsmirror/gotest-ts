@@ -34,6 +34,7 @@
 ;; - DWIM (Do What I Mean) test execution
 ;; - Support for customizable subtest field names
 ;; - Navigation between subtests with next/previous commands
+;; - Imenu integration for quick navigation to any test or subtest
 ;;
 ;; Usage:
 ;; Place your cursor on a test function or within a subtest case and run:
@@ -42,6 +43,10 @@
 ;; Navigate between subtests:
 ;; M-x gotest-ts-next-subtest  ; Go to next subtest
 ;; M-x gotest-ts-prev-subtest  ; Go to previous subtest
+;;
+;; Quick navigation with imenu:
+;; M-x imenu  ; Shows all tests and subtests in a menu
+;; Or use imenu-list for a sidebar view of all tests
 ;;
 ;; For table-driven tests like:
 ;;   func TestExample(t *testing.T) {
@@ -59,10 +64,10 @@
 ;; The package will automatically detect if you're on a specific test case
 ;; and run only that subtest, or run the entire function if you're elsewhere.
 ;;
-;; Suggested keybinding:
-;; (define-key go-ts-mode-map (kbd "C-c t r") #'gotest-ts-run-dwim)
-;; (define-key go-ts-mode-map (kbd "C-c t n") #'gotest-ts-next-subtest)
-;; (define-key go-ts-mode-map (kbd "C-c t p") #'gotest-ts-prev-subtest)
+;; Setup:
+;; (require 'gotest-ts)
+;; (gotest-ts-setup-keybindings)  ; Optional keybindings
+;; (add-hook 'go-ts-mode-hook #'gotest-ts-imenu-setup)  ; Enable imenu
 
 ;;; Code:
 
@@ -352,6 +357,93 @@ Returns a list of (position . subtest-name) pairs, sorted by position."
                  (1+ prev-index)
                  (length subtests))))))
 
+;;; Imenu Integration
+
+(defun gotest-ts-imenu-create-index ()
+  "Create imenu index for Go tests and subtests.
+Creates entries in the format 'TestName' and 'TestName::subtest_name'."
+  (when (and (buffer-file-name)
+             (string-match-p "_test\\.go\\'" (buffer-file-name))
+             (or (derived-mode-p 'go-mode 'go-ts-mode))
+             (treesit-available-p)
+             (treesit-language-available-p 'go))
+
+    (let ((index '()))
+      (save-excursion
+        (goto-char (point-min))
+
+        ;; Find all function declarations
+        (while (re-search-forward "^func \\(Test[A-Za-z0-9_]*\\)" nil t)
+          (let* ((func-name (match-string 1))
+                 (func-start (line-beginning-position))
+                 (func-node nil)
+                 (subtests '()))
+
+            ;; Add the main test function
+            (push (cons func-name func-start) index)
+
+            ;; Find subtests within this function
+            (save-excursion
+              (goto-char func-start)
+              (setq func-node (treesit-defun-at-point))
+
+              (when func-node
+                (let ((func-end (treesit-node-end func-node)))
+                  ;; Search for literal_value nodes within this function
+                  (treesit-search-subtree
+                   func-node
+                   (lambda (node)
+                     (when (string-equal (treesit-node-type node) "literal_value")
+                       (let ((children (treesit-node-children node))
+                             (subtest-name nil)
+                             (name-position nil))
+
+                         ;; Look for the subtest field name
+                         (dolist (child children)
+                           (when (and (string-equal (treesit-node-type child) "keyed_element")
+                                      (not subtest-name)) ; Only take the first match
+                             (let ((child-text (treesit-node-text child)))
+                               (when (string-match
+                                      (format "^%s\\s-*:\\s-*[`\"]\\([^`\"]*\\)[`\"]"
+                                              (regexp-quote gotest-ts-subtest-field-name))
+                                      child-text)
+                                 (setq subtest-name (match-string 1 child-text))
+                                 (setq name-position (treesit-node-start child))))))
+
+                         ;; If we found a subtest, add it
+                         (when (and subtest-name name-position)
+                           (let ((clean-name (replace-regexp-in-string "\\s-+" "_" subtest-name)))
+                             (push (cons (format "%s::%s" func-name clean-name) name-position) index)))))
+                     nil) ; Continue searching
+                   t)))))) ; Include current node
+
+        ;; Sort by position in file
+        (sort index (lambda (a b) (< (cdr a) (cdr b))))))))
+
+;;;###autoload
+(defun gotest-ts-imenu-setup ()
+  "Set up imenu integration for Go tests.
+Add this to your go-ts-mode-hook or go-mode-hook to enable
+automatic imenu support for test navigation."
+  (when (and (buffer-file-name)
+             (string-match-p "_test\\.go\\'" (buffer-file-name)))
+    (setq-local imenu-create-index-function #'gotest-ts-imenu-create-index)
+    (setq-local imenu-auto-rescan t)))
+
+;;;###autoload
+(defun gotest-ts-imenu-goto ()
+  "Open imenu for quick navigation to tests and subtests.
+This is a convenience wrapper around `imenu' specifically for Go tests."
+  (interactive)
+  (if (and (buffer-file-name)
+           (string-match-p "_test\\.go\\'" (buffer-file-name)))
+      (progn
+        (unless imenu-create-index-function
+          (gotest-ts-imenu-setup))  ; Ensure imenu is set up
+        (call-interactively #'imenu))
+    (user-error "Current buffer is not a Go test file")))
+
+;; Suggested keybindings (users can add these to their config)
 ;;;###autoload
 (defun gotest-ts-setup-keybindings ()
   "Set up suggested keybindings for gotest-ts in Go modes.
@@ -360,20 +452,32 @@ Binds the following keys in `go-mode-map' and `go-ts-mode-map':
 - C-c t f: `gotest-ts-run-function'
 - C-c t i: `gotest-ts-show-test-info'
 - C-c t n: `gotest-ts-next-subtest'
-- C-c t p: `gotest-ts-prev-subtest'"
+- C-c t p: `gotest-ts-prev-subtest'
+- C-c t m: `gotest-ts-imenu-goto'"
   (interactive)
 
   (let ((bindings '(("C-c t r" . gotest-ts-run-dwim)
                     ("C-c t f" . gotest-ts-run-function)
                     ("C-c t i" . gotest-ts-show-test-info)
                     ("C-c t n" . gotest-ts-next-subtest)
-                    ("C-c t p" . gotest-ts-prev-subtest))))
+                    ("C-c t p" . gotest-ts-prev-subtest)
+                    ("C-c t m" . gotest-ts-imenu-goto))))
 
     (dolist (binding bindings)
       (when (boundp 'go-mode-map)
         (define-key go-mode-map (kbd (car binding)) (cdr binding)))
       (when (boundp 'go-ts-mode-map)
         (define-key go-ts-mode-map (kbd (car binding)) (cdr binding))))))
+
+;;;###autoload
+(defun gotest-ts-setup ()
+  "Complete setup for gotest-ts including keybindings and imenu.
+This is a convenience function that sets up both keybindings and imenu integration."
+  (interactive)
+  (gotest-ts-setup-keybindings)
+  (when (and (buffer-file-name)
+             (string-match-p "_test\\.go\\'" (buffer-file-name)))
+    (gotest-ts-imenu-setup)))
 
 (provide 'gotest-ts)
 
