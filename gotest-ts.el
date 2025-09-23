@@ -116,26 +116,38 @@ Returns nil if not inside a test function."
 (defun gotest-ts--find-subtest-name ()
   "Find the subtest name at point within a table-driven test.
 Returns the subtest name if found, nil otherwise."
-  (let* ((struct-node (treesit-parent-until
-                       (treesit-node-at (point))
-                       (lambda (n)
-                         (string-equal (treesit-node-type n) "literal_value"))))
-         (subtest-name nil))
+  (let ((current-node (treesit-node-at (point)))
+        (subtest-name nil))
 
-    (when struct-node
-      (let ((children (treesit-node-children struct-node)))
-        (dolist (child children)
-          (when (string-equal (treesit-node-type child) "keyed_element")
-            (let ((child-text (treesit-node-text child)))
-              ;; Match various patterns: name: "value", name:"value", name:`value`
-              (when (string-match
-                     (format "^%s\\s-*:\\s-*[`\"]\\([^`\"]*\\)[`\"]"
-                             (regexp-quote gotest-ts-subtest-field-name))
-                     child-text)
-                (setq subtest-name
-                      (replace-regexp-in-string
-                       "\\s-+" "_"  ; Replace spaces with underscores
-                       (match-string 1 child-text)))))))))
+    ;; Walk up the tree to find all literal_value nodes
+    (while (and current-node (not subtest-name))
+      (when (string-equal (treesit-node-type current-node) "literal_value")
+        ;; Check if this literal_value contains our subtest field name
+        (let ((children (treesit-node-children current-node))
+              (found-subtest-field nil))
+
+          (dolist (child children)
+            (when (string-equal (treesit-node-type child) "keyed_element")
+              (let ((child-text (treesit-node-text child)))
+                ;; Match various patterns: name: "value", name:"value", name:`value`
+                (when (string-match
+                       (format "^%s\\s-*:\\s-*[`\"]\\([^`\"]*\\)[`\"]"
+                               (regexp-quote gotest-ts-subtest-field-name))
+                       child-text)
+                  (setq subtest-name
+                        (replace-regexp-in-string
+                         "\\s-+" "_"  ; Replace spaces with underscores
+                         (match-string 1 child-text)))
+                  (setq found-subtest-field t)))))
+
+          ;; If we found the subtest field in this literal_value, we're done
+          (when found-subtest-field
+            (setq current-node nil))))
+
+      ;; Move to parent node if we haven't found the subtest name yet
+      (unless subtest-name
+        (setq current-node (treesit-node-parent current-node))))
+
     subtest-name))
 
 (defun gotest-ts--build-test-pattern ()
