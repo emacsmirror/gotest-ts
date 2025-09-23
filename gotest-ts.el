@@ -1,14 +1,13 @@
-;;; gotest-ts.el --- Gotest with treesitter -*- lexical-binding: t -*-
+;;; gotest-ts.el --- Go test runner with tree-sitter support -*- lexical-binding: t -*-
 
 ;; Author: Chmouel Boudjnah
 ;; Maintainer: Chmouel Boudjnah
-;; Version: 0.2
+;; Version: 0.3
 ;; Package-Requires: ((emacs "29.1") (gotest "0.16.0"))
 ;; Homepage: https://github.com/chmouel/gotest-ts.el
-;; Keywords: languages, go, tests
+;; Keywords: languages, go, tests, tree-sitter
 
-
-;; This file is not part of GNU Emacs
+;; This file is not part of GNU Emacs.
 
 ;; This program is free software: you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -23,59 +22,210 @@
 ;; You should have received a copy of the GNU General Public License
 ;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 ;;; Commentary:
 
-;; This mode provides Emacs functionality for running tests using GoTest
-;; and Treesitter.
+;; This package provides enhanced Go test running capabilities using tree-sitter
+;; for accurate syntax parsing. It intelligently detects test functions and
+;; subtests at point, allowing you to run specific tests with a single command.
 ;;
-;; It supports running test functions and subtests in .go files with Treesitter
-;; support.
+;; Features:
+;; - Automatic detection of test functions and table-driven subtests
+;; - Tree-sitter powered parsing for reliable syntax understanding
+;; - DWIM (Do What I Mean) test execution
+;; - Support for customizable subtest field names
 ;;
-;; Bug:
-;; When you have different structure inside a subtest that has a Name: it would
-;; pick up the wrong one.You just need to place yourself in the right struct
-;; where the name is.
+;; Usage:
+;; Place your cursor on a test function or within a subtest case and run:
+;; M-x gotest-ts-run-dwim
 ;;
+;; For table-driven tests like:
+;;   func TestExample(t *testing.T) {
+;;       tests := []struct {
+;;           name string
+;;           input int
+;;           want int
+;;       }{
+;;           {name: "case 1", input: 1, want: 2},
+;;           {name: "case 2", input: 2, want: 4},
+;;       }
+;;       // ...
+;;   }
+;;
+;; The package will automatically detect if you're on a specific test case
+;; and run only that subtest, or run the entire function if you're elsewhere.
+;;
+;; Suggested keybinding:
+;; (define-key go-ts-mode-map (kbd "C-c t r") #'gotest-ts-run-dwim)
+
 ;;; Code:
 
 (require 'gotest)
 (require 'treesit)
 
-(defcustom gotest-ts-get-subtest-key "name"
-  "The key used to identify a subtest in a struct.
-Default is \"name\"."
+(defgroup gotest-ts nil
+  "Go test runner with tree-sitter support."
+  :group 'tools
+  :group 'go
+  :prefix "gotest-ts-")
+
+(defcustom gotest-ts-subtest-field-name "name"
+  "The field name used to identify a subtest in table-driven tests.
+This is typically 'name' but could be 'description', 'testName', etc."
   :type 'string
   :group 'gotest-ts)
 
-(defun gotest-ts-get-subtest-ts ()
-  "Get the test function or subtest at point."
+(defcustom gotest-ts-require-go-mode t
+  "Whether to require the buffer to be in a Go mode before running tests.
+When non-nil, commands will only work in `go-mode' or `go-ts-mode'."
+  :type 'boolean
+  :group 'gotest-ts)
+
+(defun gotest-ts--validate-environment ()
+  "Validate that the current environment supports gotest-ts operations.
+Returns non-nil if valid, signals an error otherwise."
+  (cond
+   ((not (buffer-file-name))
+    (user-error "Buffer is not visiting a file"))
+
+   ((not (string-match-p "_test\\.go\\'" (buffer-file-name)))
+    (user-error "Current file is not a Go test file (*_test.go)"))
+
+   ((and gotest-ts-require-go-mode
+         (not (derived-mode-p 'go-mode 'go-ts-mode)))
+    (user-error "Current buffer is not in Go mode"))
+
+   ((not (treesit-available-p))
+    (user-error "Tree-sitter is not available in this Emacs build"))
+
+   ((not (treesit-language-available-p 'go))
+    (user-error "Go language support is not available for tree-sitter"))
+
+   (t t)))
+
+(defun gotest-ts--get-test-function-name ()
+  "Get the name of the test function at point.
+Returns nil if not inside a test function."
+  (let ((defun-node (treesit-defun-at-point)))
+    (when defun-node
+      (let* ((name-node (treesit-node-child-by-field-name defun-node "name"))
+             (func-name (when name-node
+                          (substring-no-properties (treesit-node-text name-node)))))
+        (when (and func-name (string-match-p "^Test" func-name))
+          func-name)))))
+
+(defun gotest-ts--find-subtest-name ()
+  "Find the subtest name at point within a table-driven test.
+Returns the subtest name if found, nil otherwise."
   (let* ((struct-node (treesit-parent-until
                        (treesit-node-at (point))
                        (lambda (n)
                          (string-equal (treesit-node-type n) "literal_value"))))
-         (funcname
-          (substring-no-properties
-           (treesit-node-text
-            (treesit-node-child-by-field-name (treesit-defun-at-point) "name"))))
-         (children (when struct-node
-                     (treesit-node-children struct-node)))
-         (subtest nil))
-    (when struct-node
-      (dolist (child children)
-        (when (and (string-equal (treesit-node-type child) "keyed_element")
-                   (string-match (concat "^" gotest-ts-get-subtest-key  ":\\s-*\"\\(.*\\)\"$") (treesit-node-text child)))
-          (setq subtest
-                (shell-quote-argument
-                 (replace-regexp-in-string " " "_" (match-string-no-properties 1 (treesit-node-text child))))))))
-    (concat (format "^%s%s$" funcname (if subtest (concat "/" subtest) "")))))
+         (subtest-name nil))
 
-(defun gotest-ts-run-dwim()
-  "Run the test function at point or the subtest at point if it is a subtest."
+    (when struct-node
+      (let ((children (treesit-node-children struct-node)))
+        (dolist (child children)
+          (when (string-equal (treesit-node-type child) "keyed_element")
+            (let ((child-text (treesit-node-text child)))
+              ;; Match various patterns: name: "value", name:"value", name:`value`
+              (when (string-match
+                     (format "^%s\\s-*:\\s-*[`\"]\\([^`\"]*\\)[`\"]"
+                             (regexp-quote gotest-ts-subtest-field-name))
+                     child-text)
+                (setq subtest-name
+                      (replace-regexp-in-string
+                       "\\s-+" "_"  ; Replace spaces with underscores
+                       (match-string 1 child-text)))))))))
+    subtest-name))
+
+(defun gotest-ts--build-test-pattern ()
+  "Build a test pattern for the current context.
+Returns a test pattern suitable for `go test -run`."
+  (let ((func-name (gotest-ts--get-test-function-name))
+        (subtest-name (gotest-ts--find-subtest-name)))
+
+    (unless func-name
+      (user-error "Not inside a test function"))
+
+    (if subtest-name
+        (format "^%s/%s$" func-name (shell-quote-argument subtest-name))
+      (format "^%s$" func-name))))
+
+;;;###autoload
+(defun gotest-ts-run-dwim ()
+  "Run the test function at point or the subtest at point if applicable.
+This command intelligently determines what test to run based on the cursor position:
+- If inside a subtest case in a table-driven test, runs only that subtest
+- If inside a test function but not in a specific subtest, runs the entire function
+- Provides helpful error messages for invalid contexts"
   (interactive)
-  (when (string-match "_test\\.go" (buffer-file-name))
-    (let ((gotest (gotest-ts-get-subtest-ts )))
-      (go-test--go-test (concat "-run " gotest " .")))))
+
+  (gotest-ts--validate-environment)
+
+  (condition-case err
+      (let ((test-pattern (gotest-ts--build-test-pattern)))
+        (message "Running test: %s" test-pattern)
+        (go-test--go-test (concat "-run " test-pattern " .")))
+
+    (error
+     (message "Error running test: %s" (error-message-string err)))))
+
+;;;###autoload
+(defun gotest-ts-run-function ()
+  "Run the entire test function at point, ignoring any subtest context."
+  (interactive)
+
+  (gotest-ts--validate-environment)
+
+  (let ((func-name (gotest-ts--get-test-function-name)))
+    (unless func-name
+      (user-error "Not inside a test function"))
+
+    (let ((test-pattern (format "^%s$" func-name)))
+      (message "Running test function: %s" test-pattern)
+      (go-test--go-test (concat "-run " test-pattern " .")))))
+
+;;;###autoload
+(defun gotest-ts-show-test-info ()
+  "Show information about the test context at point.
+Displays the test function name and subtest name (if any) in the minibuffer."
+  (interactive)
+
+  (condition-case nil
+      (gotest-ts--validate-environment)
+    (error
+     (message "Not in a valid Go test context")
+     (return)))
+
+  (let ((func-name (gotest-ts--get-test-function-name))
+        (subtest-name (gotest-ts--find-subtest-name)))
+
+    (cond
+     ((and func-name subtest-name)
+      (message "Test function: %s, Subtest: %s" func-name subtest-name))
+     (func-name
+      (message "Test function: %s" func-name))
+     (t
+      (message "Not inside a test function")))))
+
+;;;###autoload
+(defun gotest-ts-setup-keybindings ()
+  "Set up suggested keybindings for gotest-ts in Go modes.
+Binds the following keys in `go-mode-map' and `go-ts-mode-map':
+- C-c t r: `gotest-ts-run-dwim'
+- C-c t f: `gotest-ts-run-function'
+- C-c t i: `gotest-ts-show-test-info'"
+  (interactive)
+
+  (let ((bindings '(("C-c t r" . gotest-ts-run-dwim)
+                    ("C-c t f" . gotest-ts-run-function)
+                    ("C-c t i" . gotest-ts-show-test-info))))
+
+    (dolist (binding bindings)
+      (when (boundp 'go-mode-map)
+        (define-key go-mode-map (kbd (car binding)) (cdr binding)))
+      (when (boundp 'go-ts-mode-map)
+        (define-key go-ts-mode-map (kbd (car binding)) (cdr binding))))))
 
 (provide 'gotest-ts)
 
