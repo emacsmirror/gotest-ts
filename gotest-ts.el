@@ -189,7 +189,7 @@ This command intelligently determines what test to run based on the cursor posit
   (condition-case err
       (let ((test-pattern (gotest-ts--build-test-pattern)))
         (message "Running test: %s" test-pattern)
-        (go-test--go-test (concat "-run " test-pattern " .")))
+        (go-test--go-test (concat "-run '" test-pattern "' .")))
 
     (error
      (message "Error running test: %s" (error-message-string err)))))
@@ -207,7 +207,7 @@ This command intelligently determines what test to run based on the cursor posit
 
     (let ((test-pattern (format "^%s$" func-name)))
       (message "Running test function: %s" test-pattern)
-      (go-test--go-test (concat "-run " test-pattern " .")))))
+      (go-test--go-test (concat "-run '" test-pattern "' .")))))
 
 ;;;###autoload
 (defun gotest-ts-show-test-info ()
